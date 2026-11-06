@@ -41,6 +41,8 @@ from ...config.config import (
 from ...utils.io_utils import run_async_to_completion, run_sync_io
 from ...config.timezone import normalize_tz
 from ..channels.conflict import (
+    clear_channel_identity,
+    find_identity_holders,
     get_channel_bot_identity,
     get_channel_config,
 )
@@ -296,7 +298,9 @@ async def list_channel_types(request: Request) -> List[str]:
 
 
 @router.get("/channels/schemas", summary="Get editable channel schemas")
-async def list_channel_schemas(request: Request) -> dict:
+async def list_channel_schemas(  # pylint: disable=too-many-branches
+    request: Request,
+) -> dict:
     from ...channel_protocol.management import MANAGEMENT_CAPABILITIES
     from ..agent_context import get_agent_for_request
 
@@ -726,6 +730,27 @@ async def get_channel(
     return single_channel_config
 
 
+def _persisted_channel_configs(channel_name: str) -> dict:
+    """Read every agent's persisted channel config, stopped agents included."""
+    from ...config.config import load_agent_config
+
+    configs: dict = {}
+    try:
+        root = load_config()
+    except Exception:  # noqa: BLE001 - conflict reporting must not fail
+        return configs
+    for agent_id in root.agents.profiles:
+        try:
+            channels = load_agent_config(agent_id).channels
+        except Exception:  # noqa: BLE001
+            continue
+        dumped = channels.model_dump() if channels else {}
+        config = dumped.get(channel_name)
+        if isinstance(config, dict):
+            configs[agent_id] = config
+    return configs
+
+
 @router.post(
     "/channels/{channel_name}/conflict-check",
     response_model=ChannelConflictResponse,
@@ -771,6 +796,7 @@ async def check_channel_conflict(
     current_agent_id = current_agent.agent_id
     manager = request.app.state.multi_agent_manager
     conflicts = []
+    running_ids = set()
 
     for agent_id, workspace in list(manager.agents.items()):
         workspace_agent_id = getattr(workspace, "agent_id", agent_id)
@@ -799,10 +825,35 @@ async def check_channel_conflict(
             continue
 
         agent_name = getattr(workspace.config, "name", "") or agent_id
+        running_ids.add(agent_id)
         conflicts.append(
             ChannelConflictAgent(
                 agent_id=agent_id,
                 agent_name=str(agent_name),
+                enabled=True,
+                running=True,
+            ),
+        )
+
+    # Persisted configs of stopped or disabled agents are the usual source of
+    # a late ACCOUNT_IN_USE: nothing is running to collide with at save time.
+    persisted = _persisted_channel_configs(channel_name)
+    persisted.pop(current_agent_id, None)
+    for agent_id, enabled, _configured in find_identity_holders(
+        channel_name,
+        proposed_identity,
+        persisted,
+    ):
+        if agent_id in running_ids:
+            continue
+        conflicts.append(
+            ChannelConflictAgent(
+                agent_id=str(agent_id),
+                agent_name=str(
+                    persisted.get(agent_id, {}).get("name") or agent_id,
+                ),
+                enabled=bool(enabled),
+                running=False,
             ),
         )
 
@@ -811,6 +862,42 @@ async def check_channel_conflict(
         conflict=bool(conflicts),
         agents=conflicts,
     )
+
+
+@router.post(
+    "/channels/{channel_name}/release",
+    response_model=dict,
+    summary="Release a duplicated channel identity",
+    description=(
+        "Clear the Bot identity from one agent's channel config and disable "
+        "that channel, so another agent can own the account. Used when a "
+        "stopped agent still holds a duplicate credential."
+    ),
+)
+async def release_channel_identity(
+    request: Request,
+    channel_name: str = Path(..., min_length=1),
+    agent_id: str = Body(..., embed=True),
+) -> dict:
+    """Release *channel_name*'s Bot identity from *agent_id*."""
+    from ...config.config import update_agent_config_async
+
+    def apply_release(candidate):
+        current = candidate.channels.model_dump() if candidate.channels else {}
+        config = current.get(channel_name)
+        if not isinstance(config, dict):
+            raise HTTPException(404, "Channel not configured for this agent")
+        if get_channel_bot_identity(channel_name, config) is None:
+            raise HTTPException(409, "No Bot identity to release")
+        current[channel_name] = clear_channel_identity(channel_name, config)
+        candidate.channels = ChannelConfig.model_validate(current)
+
+    try:
+        saved = await update_agent_config_async(agent_id, apply_release)
+    except FileNotFoundError:
+        raise HTTPException(404, "Agent not found") from None
+    schedule_agent_reload(request, agent_id)
+    return saved.channels.model_dump(mode="json")[channel_name]
 
 
 @router.put(

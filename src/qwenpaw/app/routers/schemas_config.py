@@ -49,10 +49,17 @@ class ChannelRestartResponse(BaseModel):
 
 
 class ChannelConflictAgent(BaseModel):
-    """Agent using the same Bot identity for a running channel."""
+    """Agent holding the same Bot identity for a channel.
+
+    ``running`` distinguishes an agent that is actually projecting the channel
+    right now from one whose persisted config would collide on the next start;
+    ``enabled`` reports whether that persisted channel is switched on.
+    """
 
     agent_id: str
     agent_name: str
+    enabled: bool = True
+    running: bool = False
 
 
 class ChannelConflictResponse(BaseModel):

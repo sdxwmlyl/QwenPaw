@@ -66,6 +66,60 @@ def get_channel_bot_identity(
     return identity
 
 
+def find_identity_holders(
+    channel_name: str,
+    identity: Optional[tuple[tuple[str, str], ...]],
+    configs: Mapping[str, Any],
+) -> list[tuple[str, bool, bool]]:
+    """Return ``(agent_id, enabled, configured)`` for configs sharing *identity*.
+
+    ``configs`` maps an agent id to that agent's channel config mapping.
+    Callers gather it from persisted agent configs, so a stopped agent still
+    shows up as a holder — that is exactly the case that produces
+    ``ACCOUNT_IN_USE`` only after both agents start.
+    """
+    if not identity:
+        return []
+    holders: list[tuple[str, bool, bool]] = []
+    for agent_id, config in configs.items():
+        if not isinstance(config, Mapping):
+            continue
+        if get_channel_bot_identity(channel_name, config) != identity:
+            continue
+        holders.append(
+            (
+                str(agent_id),
+                bool(config.get("enabled")),
+                bool(
+                    any(
+                        _normalize_identity_value(field, config.get(field))
+                        for field in _CHANNEL_IDENTITY_FIELDS[channel_name]
+                    ),
+                ),
+            ),
+        )
+    return sorted(holders)
+
+
+def clear_channel_identity(
+    channel_name: str,
+    config: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return a copy of *config* with the Bot identity cleared and disabled.
+
+    Releasing an identity must also disable the channel: leaving it enabled
+    with an empty token only moves the failure to the next start.
+    """
+    fields = _CHANNEL_IDENTITY_FIELDS.get(channel_name)
+    if not fields:
+        return dict(config)
+    cleared = dict(config)
+    for field in fields:
+        cleared[field] = ""
+    cleared["enabled"] = False
+    return cleared
+
+
 def get_channel_config(channels: Any, channel_name: str) -> Any:
     """Read a built-in channel config by name."""
     if channels is None:
