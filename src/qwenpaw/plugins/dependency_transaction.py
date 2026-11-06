@@ -9,6 +9,7 @@ import csv
 import hashlib
 import hmac
 import json
+import logging
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -1009,6 +1010,42 @@ def rollback(directory):
     return True
 
 
+def _prune_duplicate_metadata(operation):
+    """Keep one ``.dist-info`` per distribution in the transaction's sites.
+
+    ``pip install --target`` (and overlay app upgrades) leave the metadata of
+    the superseded version behind.  Two ``.dist-info`` directories for one
+    distribution make the inventory report
+    ``DEPENDENCY_ENVIRONMENT_AMBIGUOUS`` and block later installs, so the copy
+    the transaction just verified is kept and the leftovers are removed.
+    """
+    from .dist_info import prune_stale
+
+    keep = {}
+    for name, row in (
+        (operation.get("environment") or {})
+        .get(
+            "distributions",
+            {},
+        )
+        .items()
+    ):
+        metadata_path = (
+            row.get("metadata_path") if isinstance(row, dict) else None
+        )
+        if metadata_path:
+            keep[name] = metadata_path
+    for site in operation["payload"]["sites"]:
+        try:
+            prune_stale(site, keep=keep or None)
+        except OSError:
+            logging.getLogger(__name__).warning(
+                "Could not prune duplicate dependency metadata in %s",
+                site,
+                exc_info=True,
+            )
+
+
 def finish(directory, operation, *, committed):
     from .dependency_maintenance import clear_maintenance, repair_marker
 
@@ -1028,6 +1065,8 @@ def finish(directory, operation, *, committed):
     for site in operation["payload"]["sites"]:
         repair_marker(site).unlink(missing_ok=True)
     clear_maintenance(operation["payload"]["sites"], operation["id"])
+    if committed:
+        _prune_duplicate_metadata(operation)
 
 
 def reconcile_commit(directory, operation):
